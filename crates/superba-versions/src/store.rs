@@ -6,13 +6,24 @@
 //! packages/<archive>              verified archives (remote uploads), + .sha256
 //! packages/<archive>.part         a download in progress (resumed)
 //! .tmp-*/                         extraction in progress (removed on failure)
+//! .trash-*/                       an entry being removed (renamed away first)
 //! .lock                           exclusive while downloading / extracting / pruning
 //! releases.json                   release list cache
 //! ```
+//!
+//! Windows (user bug 40): a directory whose `codex.exe` runs (ChatGPT or a
+//! terminal started it, e.g. through `CODEX_CLI_PATH`) or that another program
+//! holds open (an antivirus scan of a new binary, the indexer) cannot be
+//! renamed or removed ("access denied", os error 5). New versions are always
+//! extracted beside the others; an entry is never removed or replaced while it
+//! is in use ([`entry_in_use`]), renames are retried for a while when Windows
+//! reports a file in use, and an entry is renamed away before it is deleted, so
+//! a failed removal never leaves a half-deleted entry without its marker.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use superba_core::{CodexVersion, Error, Result, StoredCodex, Timestamp};
 
@@ -166,11 +177,139 @@ pub fn list(dirs: &StoreDirs, target: Option<&str>) -> Vec<StoredCodex> {
     out
 }
 
+/// Pauses between attempts of a rename Windows refuses because a file is in
+/// use (an antivirus scan of a freshly written `codex.exe` holds it briefly).
+const IN_USE_RETRIES: [Duration; 6] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(3),
+];
+
+/// A file-system error that a file in use explains: on Windows
+/// `ERROR_ACCESS_DENIED` (5, also what renaming a directory with an open or
+/// running file inside gives), `ERROR_SHARING_VIOLATION` (32) and
+/// `ERROR_LOCK_VIOLATION` (33); a busy executable or resource elsewhere.
+pub fn is_in_use(e: &io::Error) -> bool {
+    (cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33)))
+        || matches!(
+            e.kind(),
+            io::ErrorKind::ExecutableFileBusy | io::ErrorKind::ResourceBusy
+        )
+}
+
+/// Run `op` again after each of `pauses` while it fails with [`is_in_use`].
+pub fn retry_in_use<T>(
+    mut op: impl FnMut() -> io::Result<T>,
+    pauses: &[Duration],
+    sleep: &dyn Fn(Duration),
+) -> io::Result<T> {
+    let mut pauses = pauses.iter();
+    loop {
+        match op() {
+            Err(e) if is_in_use(&e) => match pauses.next() {
+                Some(pause) => sleep(*pause),
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
+/// `fs::rename`, retried for a few seconds while a file is in use.
+pub fn rename_retrying(from: &Path, to: &Path) -> io::Result<()> {
+    retry_in_use(
+        || fs::rename(from, to),
+        &IN_USE_RETRIES,
+        &std::thread::sleep,
+    )
+}
+
+/// The error for an entry that cannot be removed or replaced because it is in
+/// use, saying what to do.
+pub fn in_use_error(dir: &Path, why: &str) -> Error {
+    Error::Locked {
+        what: format!(
+            "the Codex in {} ({why}); Superba never removes or replaces a Codex that is in \
+             use. Quit what runs it (ChatGPT, a terminal) and try again",
+            dir.display()
+        ),
+    }
+}
+
+/// `path` without the verbatim `\\?\` prefix of a canonical Windows drive path.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|t| t.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// Why the store entry `dir` must not be removed or replaced now: a running
+/// process's program lives in it, or (Windows) its `codex.exe` is open in
+/// another program. `None` when it is free.
+pub fn entry_in_use(dir: &Path, target: &str) -> Option<String> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let root = plain(fs::canonicalize(dir).ok()?);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let same = |a: &Path, b: &Path| {
+        if cfg!(windows) {
+            a.to_string_lossy()
+                .to_lowercase()
+                .starts_with(&b.to_string_lossy().to_lowercase())
+        } else {
+            a.starts_with(b)
+        }
+    };
+    if let Some(p) = sys.processes().values().find(|p| {
+        p.exe()
+            .is_some_and(|exe| same(&plain(exe.to_path_buf()), &root))
+    }) {
+        return Some(format!("process {} runs a program from it", p.pid()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let exe = dir.join("bin").join(exe_name(target));
+        // No sharing at all: fails while the binary runs or is open elsewhere.
+        if exe.is_file()
+            && let Err(e) = fs::OpenOptions::new().read(true).share_mode(0).open(&exe)
+            && is_in_use(&e)
+        {
+            return Some(format!(
+                "its {} is open in another program",
+                exe_name(target)
+            ));
+        }
+    }
+    let _ = target;
+    None
+}
+
 /// Remove entries of `target` beyond the newest [`KEEP_NEWEST`] versions,
-/// never one in `keep`; their archives go too, as do archives of versions no
-/// longer kept and leftovers of interrupted extractions. Returns removed
-/// versions. Call with the store lock held.
+/// never one in `keep` nor one in use ([`entry_in_use`]; it is kept and tried
+/// again next time); their archives go too, as do archives of versions no
+/// longer kept and leftovers of interrupted extractions and removals. Returns
+/// removed versions. Call with the store lock held.
 pub fn prune(dirs: &StoreDirs, target: &str, keep: &[CodexVersion]) -> Result<Vec<CodexVersion>> {
+    prune_with(dirs, target, keep, &entry_in_use, &remove_dir)
+}
+
+/// [`prune`] with the in-use check and the removal supplied (tests).
+pub fn prune_with(
+    dirs: &StoreDirs,
+    target: &str,
+    keep: &[CodexVersion],
+    in_use: &dyn Fn(&Path, &str) -> Option<String>,
+    remove: &dyn Fn(&Path) -> Result<()>,
+) -> Result<Vec<CodexVersion>> {
     let entries = list(dirs, Some(target));
     let mut kept: Vec<CodexVersion> = keep.to_vec();
     let mut newest = 0;
@@ -184,8 +323,19 @@ pub fn prune(dirs: &StoreDirs, target: &str, keep: &[CodexVersion]) -> Result<Ve
             kept.push(e.version.clone());
             continue;
         }
-        remove_dir(&dirs.entry(&e.version, target))?;
-        removed.push(e.version.clone());
+        let dir = dirs.entry(&e.version, target);
+        if let Some(why) = in_use(&dir, target) {
+            tracing::info!(dir = %dir.display(), why, "keeping a Codex in use");
+            kept.push(e.version.clone());
+            continue;
+        }
+        match remove(&dir) {
+            Ok(()) => removed.push(e.version.clone()),
+            Err(err) => {
+                tracing::warn!(dir = %dir.display(), error = %err, "cannot remove an old Codex; kept");
+                kept.push(e.version.clone());
+            }
+        }
     }
     // Archives: those of kept versions and the newest few others (remote
     // uploads for other targets) stay.
@@ -221,8 +371,9 @@ pub fn prune(dirs: &StoreDirs, target: &str, keep: &[CodexVersion]) -> Result<Ve
     }
     if let Ok(rd) = fs::read_dir(&dirs.root) {
         for f in rd.flatten() {
-            if f.file_name().to_string_lossy().starts_with(".tmp-") {
-                let _ = remove_dir(&f.path());
+            let name = f.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".tmp-") || name.starts_with(".trash-") {
+                let _ = fs::remove_dir_all(f.path());
             }
         }
     }
@@ -234,15 +385,28 @@ fn archive_base(name: &str) -> &str {
     name.trim_end_matches(".sha256").trim_end_matches(".part")
 }
 
-/// Remove a directory tree (renamed away first, so a half-removed entry is
-/// never mistaken for a complete one).
+/// Remove a directory tree. It is renamed away first (to `.trash-*` beside
+/// it, retried while a file is in use) and only then deleted, so a directory
+/// that cannot go (a file in it is in use) stays whole, marker included,
+/// instead of becoming a half-deleted entry; what cannot be deleted after the
+/// rename is left in the trash for a later [`prune`].
 pub fn remove_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
-    let marker = dir.join(VERIFIED_MARKER);
-    let _ = fs::remove_file(&marker);
-    fs::remove_dir_all(dir).map_err(|e| Error::io(dir, &e))
+    let parent = dir.parent().unwrap_or(Path::new("."));
+    let trash = parent.join(format!(".trash-{}", nonce()));
+    if let Err(e) = rename_retrying(dir, &trash) {
+        return Err(if is_in_use(&e) {
+            in_use_error(dir, &format!("a file in it is in use: {e}"))
+        } else {
+            Error::io(dir, &e)
+        });
+    }
+    if let Err(e) = fs::remove_dir_all(&trash) {
+        tracing::info!(trash = %trash.display(), error = %e, "removal left files behind; a later prune retries");
+    }
+    Ok(())
 }
 
 /// A fresh temporary directory name in the store.

@@ -156,6 +156,7 @@ usage.subtitle = "Codex requests on this computer: recent, in flight and statist
 [phase]
 applying = "Writing configuration"
 done = "Done"
+done_failed = "Finished, but a step failed"
 force_quit = "Asking whether to force quit"
 full_restart_offer = "Restart IPC failed"
 launching = "Opening ChatGPT"
@@ -246,6 +247,7 @@ stale = "{n} codex {n|process in a terminal still uses|processes in terminals st
 switch_failed = "Switching to “{dest}” failed"
 switched = "Switched to {line} · {secs} s"
 timed = "{title} · {secs} s"
+written_launch_failed = "Config written, but ChatGPT did not open again"
 written_not_running = "Config written. ChatGPT isn't running; it takes effect the next time it opens."
 written_only = "Config written. Restart ChatGPT yourself to apply it."
 

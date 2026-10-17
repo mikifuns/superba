@@ -424,35 +424,19 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    //! Windows: MSIX activation through COM, direct spawn otherwise. Not exercised
-    //! in CI (Linux); kept small. Environment variables cannot be passed to an
-    //! activated package.
+    //! Windows: an MSIX install is activated by its AUMID through
+    //! `IApplicationActivationManager::ActivateApplication` (the arguments go
+    //! with it; the call returns the new process id), so the app keeps its
+    //! package identity. Activation takes no environment: the activated
+    //! process gets the user environment (`HKCU\Environment`, which the switch
+    //! flow writes before a restart), never Superba's. Installs that are not
+    //! packaged are spawned directly. Exercised on a real Windows runner by
+    //! `tests/windows_app_it.rs`.
     use std::path::Path;
 
     use superba_core::{AppInstall, Error, Result};
 
     use super::{LaunchSpec, Spawned, configure_command, spawn_direct};
-
-    fn aumid(install: &AppInstall) -> Option<String> {
-        // MSIX installs carry their package family name as id
-        // (`OpenAI.Codex_2p2nqsd0c76g0`); the application id comes from the manifest.
-        if !install.id.contains('_') || install.id.contains(':') {
-            return None;
-        }
-        let manifest = std::fs::read_to_string(install.path.join("AppxManifest.xml")).ok();
-        let app_id = manifest
-            .as_deref()
-            .and_then(crate::install::parse_appx_application_id)
-            .unwrap_or_else(|| "App".to_owned());
-        Some(format!("{}!{}", install.id, app_id))
-    }
-
-    fn quote_arg(a: &str) -> String {
-        if !a.is_empty() && !a.contains([' ', '\t', '"']) {
-            return a.to_owned();
-        }
-        format!("\"{}\"", a.replace('"', "\\\""))
-    }
 
     fn activate(aumid: &str, args: &[String]) -> Result<u32> {
         use windows::Win32::System::Com::{
@@ -463,13 +447,10 @@ mod imp {
             AO_NONE, ApplicationActivationManager, IApplicationActivationManager,
         };
         use windows::core::HSTRING;
-        let joined = args
-            .iter()
-            .map(|a| quote_arg(a))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let joined = crate::appx::windows_command_line(args);
         // SAFETY: plain COM calls on this thread; the interface pointer is released
-        // when dropped and COM is uninitialized afterwards.
+        // when dropped and COM is uninitialized afterwards when this call
+        // initialized it.
         unsafe {
             let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let result = (|| -> windows::core::Result<u32> {
@@ -481,7 +462,7 @@ mod imp {
                 CoUninitialize();
             }
             result.map_err(|e| Error::Process {
-                message: format!("ActivateApplication({aumid}) failed: {e}"),
+                message: format!("Windows could not start the app {aumid}: {e}"),
             })
         }
     }
@@ -491,7 +472,19 @@ mod imp {
         install: &AppInstall,
         log: Option<&Path>,
     ) -> Result<Spawned> {
-        if let Some(id) = aumid(install) {
+        if let Some(id) = crate::appx::resolve_aumid(install) {
+            if spec.env_set.contains_key("HOME") || spec.env_set.contains_key("USERPROFILE") {
+                return Err(Error::Unsupported {
+                    what: "an isolated home for the packaged (MSIX) app".into(),
+                });
+            }
+            if !spec.env_set.is_empty() {
+                tracing::info!(
+                    env = ?spec.env_set.keys().collect::<Vec<_>>(),
+                    "the packaged app reads these from the user environment, not from the launch"
+                );
+            }
+            tracing::info!(aumid = %id, "activating the packaged app");
             let pid = activate(&id, &spec.args)?;
             return Ok(Spawned { pid: Some(pid) });
         }
