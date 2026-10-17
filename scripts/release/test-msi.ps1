@@ -43,10 +43,8 @@ function ComGet($obj, $name, [object[]]$params) {
 }
 function ArpEntries {
   $wi = New-Object -ComObject WindowsInstaller.Installer
-  $codes = ComGet $wi 'RelatedProducts' @($upgradeCode)
-  $n = ComGet $codes 'Count' @()
-  for ($i = 0; $i -lt $n; $i++) {
-    $code = ComGet $codes 'Item' @($i)
+  # The pipeline enumerates the returned StringList: one product code each.
+  foreach ($code in @(ComGet $wi 'RelatedProducts' @($upgradeCode))) {
     [pscustomobject]@{
       ProductCode    = $code
       DisplayName    = ComGet $wi 'ProductInfo' @($code, 'ProductName')
