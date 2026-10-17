@@ -10,6 +10,10 @@ name: Windows app
 
 on:
   workflow_dispatch:
+  # The iteration branch for this job (a workflow_dispatch needs the file on
+  # the default branch first).
+  push:
+    branches: [ci/winapp]
 
 # Third-party actions are pinned to full commit SHAs (version in a comment).
 permissions:
