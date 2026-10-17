@@ -73,8 +73,12 @@ jobs:
           Get-AppxPackage -Name OpenAI.Codex | Format-List Name, PackageFullName, PackageFamilyName, InstallLocation, Version, SignatureKind, Status
           $root = (Get-AppxPackage -Name OpenAI.Codex).InstallLocation
           "root=$root" >> $env:GITHUB_ENV
-          (Get-Acl $root).Access | Format-Table IdentityReference, FileSystemRights, AccessControlType -AutoSize
-          (Get-Acl (Split-Path $root)).Access | Format-Table IdentityReference, FileSystemRights, AccessControlType -AutoSize
+          foreach ($dir in @((Split-Path $root), $root)) {
+            "--- ACL of ${dir}:"
+            (Get-Acl $dir).Access | ForEach-Object {
+              "  $($_.IdentityReference): $($_.FileSystemRights) $($_.AccessControlType) (inherit: $($_.InheritanceFlags))"
+            }
+          }
       - name: What a standard user may do with the package files
         shell: pwsh
         continue-on-error: true
@@ -107,9 +111,10 @@ jobs:
           Set-Content -Path "$probe\probe.ps1" -Value $script
           $cred = New-Object System.Management.Automation.PSCredential($name, $secure)
           try {
+            # One argument string: Start-Process does not quote array elements.
+            $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$probe\probe.ps1`" `"$env:root`" `"$probe\out.txt`""
             $p = Start-Process -FilePath 'powershell.exe' -Credential $cred -LoadUserProfile -WorkingDirectory $probe `
-              -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$probe\probe.ps1", $env:root, "$probe\out.txt") `
-              -Wait -PassThru -WindowStyle Hidden
+              -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
             "standard user probe exited with $($p.ExitCode)"
           } catch {
             "cannot start a process as the standard user: $($_.Exception.Message)"
@@ -128,11 +133,12 @@ jobs:
         with:
           key: winapp
           cache-on-failure: true
-      - name: Build the tests
+      - name: Build the tests and spb
         shell: bash
         run: |
           cargo test -p superba-appctl --locked --no-run --test windows_app_it
           cargo test -p superba-gui --locked --no-run --test windows_settings_it
+          cargo build -p superba-cli --locked --bin spb
       - name: Activate, CDP, quit and relaunch the packaged app
         shell: bash
         env:
@@ -148,6 +154,36 @@ jobs:
           SUPERBA_DATA_DIR: ${{ runner.temp }}/superba-data
           SUPERBA_SECRET_BACKEND: file
         run: cargo test -p superba-gui --locked --test windows_settings_it -- --ignored --nocapture
+      - name: "The user's flow: restart through spb an app that Windows started"
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          SUPERBA_DATA_DIR: ${{ runner.temp }}\spb-data
+          SUPERBA_SECRET_BACKEND: file
+          SUPERBA_LOCALE: zh-CN
+        run: |
+          $spb = Join-Path $PWD 'target\debug\spb.exe'
+          function Show-App($label) {
+            "--- ${label}:"
+            Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe'" |
+              Where-Object { $_.CommandLine -notmatch '--type=' } |
+              ForEach-Object { "  pid $($_.ProcessId) parent $($_.ParentProcessId): $($_.CommandLine)" }
+          }
+          # Opened the way the user opens it (Start menu), so without a debugging port.
+          Start-Process explorer.exe 'shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App'
+          Start-Sleep -Seconds 20
+          Show-App 'opened from the Start menu'
+          '=== spb launch --restart --yes --force (no CDP: windows close, then forced)'
+          & $spb launch --restart --yes --force
+          "exit $LASTEXITCODE"
+          Show-App 'after the first restart'
+          '=== spb launch --restart --yes (CDP: the app quits by itself)'
+          & $spb launch --restart --yes
+          "exit $LASTEXITCODE"
+          Show-App 'after the second restart'
+          '=== spb status'
+          & $spb status
+          Get-Process ChatGPT -ErrorAction SilentlyContinue | Stop-Process -Force
       - name: App processes and logs
         if: ${{ always() }}
         shell: pwsh
